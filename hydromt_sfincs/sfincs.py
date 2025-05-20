@@ -1402,6 +1402,121 @@ class SfincsModel(GridModel):
         # Remove qinf variable in sfincs
         self.config.pop("qinf", None)
 
+    # Function to create curve number for SFINCS including recovery via saturated hydraulic conductivity [mm/hr]
+    def setup_green_ampt_infiltration(
+        self,
+        soil_fn: str = "soilgrids_2020",
+        ksatver_ptf : str = "brakensiek",
+        reproj_method="average"
+        ):
+
+        """Compute stuff for green ampt
+
+        Parameters
+        ----------
+        ds : xarray.Dataset
+            Dataset containing soil properties.
+        soil_fn : str
+            name of the soil dataset
+        ksatver_ptf : str
+            PTF to use for calculation KsatVer.
+        """
+
+        # Read the datafiles
+        ds = self.data_catalog.get_rasterdataset(
+            soil_fn, bbox=self.mask.raster.transform_bounds(4326), buffer=10
+        )
+
+        # ds = xr.where(ds["sltppt_sl1"] == ds["sltppt_sl1"].raster.nodata, np.nan, ds)
+        ds = ds.raster.mask_nodata()
+
+        # concat along a sl dimension
+        ds = workflows.soilgrids.concat_layers(ds, soil_fn)
+
+        thetas_sl = xr.apply_ufunc(
+            workflows.soilgrids.thetas_toth,
+            ds["ph"],
+            ds["bd"],
+            ds["clyppt"],
+            ds["sltppt"],
+            dask="parallelized",
+            output_dtypes=[float],
+            keep_attrs=True,
+        )
+
+        if soil_fn == "soilgrids_2020":
+            thetas = workflows.soilgrids.average_soillayers_block(thetas_sl, ds["soilthickness"])
+        else:
+            thetas = workflows.soilgrids.average_soillayers(thetas_sl, ds["soilthickness"])
+
+        thetar_sl = xr.apply_ufunc(
+            workflows.soilgrids.thetar_rawls_brakensiek,
+            ds["sndppt"],
+            ds["clyppt"],
+            thetas_sl,
+            dask="parallelized",
+            output_dtypes=[float],
+            keep_attrs=True,
+        )
+
+        if soil_fn == "soilgrids_2020":
+            thetar = workflows.soilgrids.average_soillayers_block(thetar_sl, ds["soilthickness"])
+        else:
+            thetar = workflows.soilgrids.average_soillayers(thetar_sl, ds["soilthickness"])
+
+        # Compute initial soil content, by assuming dry conditions (about 10% saturation)
+        thetai = (thetar + thetas) * 0.1
+
+        # Compute soil moisture deficit
+        da_sigma = (thetas - thetai).astype(np.float32).load()
+
+        # Compute saturated hydraulic conductivity
+        kv_sl_hr = workflows.soilgrids.kv_layers(ds, thetas_sl, ksatver_ptf)
+        kv_sl = np.log(kv_sl_hr)
+        kv_sl = np.exp(kv_sl)
+
+        # Select saturated hydraulic conductivity at upper soil layer
+        da_ks = kv_sl.sel(sl=1).astype(np.float32).load()
+
+        # Compute air entry pressure as proxy for suction at the wetting front
+        psi_sl = xr.apply_ufunc(
+            workflows.soilgrids.air_entry_pressure,
+            ds["sndppt"],
+            ds["clyppt"],
+            dask="parallelized",
+            output_dtypes=[float],
+            keep_attrs=True,
+        )
+
+        # Select air entry pressure at upper soil layer
+        da_psi = psi_sl.sel(sl=1).astype(np.float32).load()
+
+        self.logger.info("Done with determination Green-Ampt stuff")
+        self.logger.info(f"Psi: {da_psi}")
+        self.logger.info(f"Ks: {da_ks}")
+        self.logger.info(f"Sigma: {da_sigma}")
+
+        # set grids for ks, sigma, and psi
+        names = ["ks", "sigma", "psi"]
+        data = [da_ks, da_sigma, da_psi]
+        
+        for name, da in zip(names, data):
+            # Set nodata
+            da.raster.set_nodata(-9999.0)
+            
+            # reproject infiltration data to model grid
+            da = da.raster.reproject_like(self.mask, method=reproj_method)
+
+            # Give metadata to the layer and set grid
+            da.attrs.update(**self._ATTRS.get(name, {}))
+            self.set_grid(da, name=name)
+
+            # update config: set maps
+            self.set_config(f"{name}file", f"sfincs.{name}")  # give it to SFINCS
+            
+        # Remove qinf variable in sfincs
+        self.config.pop("qinf", None)
+
     # Roughness
     def setup_manning_roughness(
         self,

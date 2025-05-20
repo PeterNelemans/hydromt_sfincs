@@ -8,3 +8,4 @@ from .merge import *
 from .tiling import *
 from .curvenumber import *
 from .storage_volume import *
+from .soilgrids import *
